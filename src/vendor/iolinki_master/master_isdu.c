@@ -326,6 +326,9 @@ void iolink_master_isdu_on_od(iolink_master_port_t* port, const uint8_t* od, uin
             if ((byte == 0x00U) || (byte == 0x01U)) {
                 continue;
             }
+            /* Table 53 T6: ISDUTime ends when the response starts. Each
+               subsequent M-sequence is watched by the port response deadline. */
+            iolink_master_port_state(port)->isdu_wait_timed = false;
             isdu->phase = IOLINK_MASTER_ISDU_PHASE_RESPONSE;
             isdu->response_len = 0U;
             isdu->response_pos = 0U;
@@ -482,6 +485,14 @@ int iolink_master_read_isdu(iolink_master_port_t* port, uint16_t index, uint8_t 
         return iolink_master_isdu_finish_read(port, data, len);
     }
 
+    /* A result may be consumed before its T8 IDLE/T11 ABORT exchange. Do not
+       let initialization of the next request erase that completion. */
+    if (iolink_master_port_state(port)->isdu.idle_pending ||
+        iolink_master_port_state(port)->isdu.abort_pending ||
+        iolink_master_port_state(port)->isdu_completion_tx != 0U) {
+        return IOLINK_MASTER_STATUS_PENDING;
+    }
+
     {
         iolink_master_isdu_state_t* isdu = &iolink_master_port_state(port)->isdu;
         uint8_t idx_len = iolink_master_isdu_index_len(index, subindex);
@@ -562,22 +573,32 @@ int iolink_master_write_isdu(iolink_master_port_t* port, uint16_t index, uint8_t
         return iolink_master_isdu_finish_write(port);
     }
 
+    if (iolink_master_port_state(port)->isdu.idle_pending ||
+        iolink_master_port_state(port)->isdu.abort_pending ||
+        iolink_master_port_state(port)->isdu_completion_tx != 0U) {
+        return IOLINK_MASTER_STATUS_PENDING;
+    }
+
     {
         iolink_master_isdu_state_t* isdu = &iolink_master_port_state(port)->isdu;
         uint8_t idx_len = iolink_master_isdu_index_len(index, subindex);
         uint16_t total =
             (uint16_t) (1U + idx_len + len + IOLINK_MASTER_ISDU_CHKPDU_LEN);
 
-        /* A.5.3: 2..15 direct, 17..238 with ExtLength; 16 and >238 are reserved. */
-        if ((len > (uint8_t) (IOLINK_ISDU_BUFFER_SIZE - IOLINK_MASTER_ISDU_WRITE_HEADER_MAX)) ||
-            (((total > 15U) ? (total + 1U) : total) > IOLINK_MASTER_ISDU_EXT_MAX) ||
-            (total == 16U)) {
+        bool extended = total > IOLINK_MASTER_ISDU_LENGTH_NIBBLE_MAX;
+        uint16_t wire_len = (uint16_t) (total + (extended ? 1U : 0U));
+
+        /* A.5.3: ExtLength includes itself. A base length of 16 therefore
+           becomes the valid extended length 17; validate the actual wire PDU. */
+        if ((wire_len > IOLINK_ISDU_BUFFER_SIZE) ||
+            (wire_len > IOLINK_MASTER_ISDU_EXT_MAX) ||
+            (extended && wire_len < IOLINK_MASTER_ISDU_EXT_MIN)) {
             return IOLINK_MASTER_ISDU_ERR_BUFFER_TOO_SMALL;
         }
 
         iolink_master_isdu_start(port, IOLINK_MASTER_ISDU_OP_WRITE, index, subindex);
         /* Table A.13: Write Request {I-Service, LEN, Index[, Index], [Subindex], Data*, CHKPDU}. */
-        if (total <= IOLINK_MASTER_ISDU_LENGTH_NIBBLE_MAX) {
+        if (!extended) {
             isdu->request[pos++] =
                 (uint8_t) ((iolink_master_isdu_service(false, idx_len)
                             << IOLINK_MASTER_ISDU_SERVICE_SHIFT) |
@@ -589,7 +610,7 @@ int iolink_master_write_isdu(iolink_master_port_t* port, uint16_t index, uint8_t
                             << IOLINK_MASTER_ISDU_SERVICE_SHIFT) |
                            IOLINK_MASTER_ISDU_LENGTH_EXTENDED);
             /* A.5.3 / Figure A.18 ex. 4: ExtLength counts the ExtLength octet too. */
-            isdu->request[pos++] = (uint8_t) (total + 1U);
+            isdu->request[pos++] = (uint8_t) wire_len;
         }
 
         if (idx_len == 3U) {

@@ -44,8 +44,14 @@ IO-Link silicon here.
 - Retries restore the outgoing ISDU cursor. Service response watchdog, illegal
   ExtLength rejection, response service validation, IDLE/ABORT completion and
   invalid-PD handling are added. All of these need hardware interop validation.
+- ISDUTime stops when the response starts; segmented transfers retain the
+  per-message response deadlines. New services wait for the preceding IDLE/ABORT
+  acknowledgement, including retries of lost or corrupt completion replies.
+  Write lengths are validated after inserting ExtLength, accepting base length
+  16 as a 17-byte PDU and rejecting wire PDUs larger than 238 bytes.
 - The retained fake device was extended for PAGE startup, MasterCycleTime ACK,
   232-byte/extended ISDU objects, malformed replies, busy replies and invalid PD.
+  START discards leftover OD padding; IDLE/ABORT releases the service state.
   Only this fixture is used by our tests; the upstream CMocka suite is not bundled.
 
 `local-changes.patch` records the exact changes to relocated upstream files.

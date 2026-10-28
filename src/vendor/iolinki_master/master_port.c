@@ -317,6 +317,7 @@ static bool iolink_master_send_isdu(iolink_master_port_t* port)
                                                  IOLINK_FLOWCTRL_ABORT);
         frame_len = iolink_master_build_isdu_frame(port, mc, NULL, multi);
         if (frame_len > 0) {
+            state->isdu_completion_tx = IOLINK_FLOWCTRL_ABORT;
             (void) iolink_master_send_full(port, state->tx_buf, (size_t) frame_len);
         }
         return frame_len > 0;
@@ -328,6 +329,7 @@ static bool iolink_master_send_isdu(iolink_master_port_t* port)
                                                  IOLINK_FLOWCTRL_IDLE);
         frame_len = iolink_master_build_isdu_frame(port, mc, NULL, multi);
         if (frame_len > 0) {
+            state->isdu_completion_tx = IOLINK_FLOWCTRL_IDLE;
             (void) iolink_master_send_full(port, state->tx_buf, (size_t) frame_len);
         }
         return frame_len > 0;
@@ -559,9 +561,10 @@ static int iolink_master_tick_common(iolink_master_port_t* port, iolink_master_t
         iolink_master_arm_send_gate(port, now_100us,
             iolink_master_tbit_to_100us(iolink_master_startup_baudrate(port),
                                       IOLINK_MASTER_T_INITCYC_TBIT) + 1U, true);
+    /* Table 53 T4/T6: the service watchdog covers response preparation only.
+       Segmented response transfers retain the per-message response deadline. */
     if (pace_cycles && state->isdu.op != IOLINK_MASTER_ISDU_OP_NONE && !state->isdu.done &&
-        (state->isdu.phase == IOLINK_MASTER_ISDU_PHASE_WAIT ||
-         state->isdu.phase == IOLINK_MASTER_ISDU_PHASE_RESPONSE)) {
+        state->isdu.phase == IOLINK_MASTER_ISDU_PHASE_WAIT) {
         if (!state->isdu_wait_timed) {
             state->isdu_wait_timed = true;
             state->isdu_wait_start = now_100us;
@@ -873,6 +876,7 @@ static int iolink_master_restart_establish(iolink_master_port_t* port, uint32_t 
     state->direct_address = 2U;
     memset(&state->isdu, 0, sizeof(state->isdu));
     state->isdu_tx_saved = false;
+    state->isdu_completion_tx = 0U;
     state->isdu_wait_timed = false;
     ret = iolink_master_reset_rate_scan(port);
     if (ret != IOLINK_MASTER_STATUS_OK) {
@@ -962,6 +966,12 @@ int iolink_master_on_timeout_at(iolink_master_port_t* port, uint32_t now_100us, 
             iolink_master_port_state(port)->state == IOLINK_MASTER_STATE_PREOPERATE) {
             iolink_master_port_state(port)->diagnostics.response_timeouts++;
             iolink_master_port_state_t* s = iolink_master_port_state(port);
+            /* Retry completion exchanges too, before admitting a new service. */
+            if (s->isdu_completion_tx != 0U) {
+                s->isdu.idle_pending = s->isdu_completion_tx == IOLINK_FLOWCTRL_IDLE;
+                s->isdu.abort_pending = s->isdu_completion_tx == IOLINK_FLOWCTRL_ABORT;
+                s->isdu_completion_tx = 0U;
+            }
             if (s->isdu_tx_saved) {
                 s->isdu.request_pos = s->saved_request_pos;
                 s->isdu.phase = s->saved_phase;
@@ -1447,6 +1457,8 @@ int iolink_master_on_rx(iolink_master_port_t* port, const uint8_t* data, uint8_t
 
         iolink_master_port_state(port)->diagnostics.rx_retry_count = 0U;
         iolink_master_port_state(port)->awaiting_response = false;
+        iolink_master_port_state(port)->isdu_completion_tx = 0U;
+        iolink_master_port_state(port)->isdu_tx_saved = false;
         iolink_master_route_od(port, data, 1U);
         return IOLINK_MASTER_STATUS_OK;
     }
@@ -1475,6 +1487,8 @@ int iolink_master_on_rx(iolink_master_port_t* port, const uint8_t* data, uint8_t
 
         iolink_master_port_state(port)->diagnostics.rx_retry_count = 0U;
         iolink_master_port_state(port)->awaiting_response = false;
+        iolink_master_port_state(port)->isdu_completion_tx = 0U;
+        iolink_master_port_state(port)->isdu_tx_saved = false;
         iolink_master_route_od(port, data, 1U);
         return IOLINK_MASTER_STATUS_OK;
     }
@@ -1507,6 +1521,7 @@ int iolink_master_on_rx(iolink_master_port_t* port, const uint8_t* data, uint8_t
     iolink_master_port_state(port)->awaiting_response = false;
     iolink_master_port_state(port)->diagnostics.od_status = resp.status;
     iolink_master_port_state(port)->isdu_tx_saved = false;
+    iolink_master_port_state(port)->isdu_completion_tx = 0U;
 
     /*
      * Dispatch on the rising edge of the OD Event flag. This turns event

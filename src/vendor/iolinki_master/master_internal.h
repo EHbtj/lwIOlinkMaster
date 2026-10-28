@@ -326,6 +326,7 @@ typedef struct
     uint8_t saved_flowctrl;
     iolink_master_isdu_phase_t saved_phase;
     bool isdu_tx_saved;
+    uint8_t isdu_completion_tx; /**< IDLE/ABORT awaiting acknowledgement, or zero. */
     uint32_t isdu_wait_start;
     bool isdu_wait_timed;
 } iolink_master_port_state_t;

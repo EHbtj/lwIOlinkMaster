@@ -245,6 +245,8 @@ typedef struct
      * ISDU response watchdog (ISDUTime, 7.3.6.3 / Table 102), in 100us units.
      * 0 selects the default of 50000 (5 s). It bounds how long the master keeps
      * polling the ISDU channel while the device answers "busy"/"no service".
+     * Stops when the response starts; subsequent segments use the per-message
+     * response deadline and retry handling rather than this service timer.
      */
     uint32_t isdu_timeout_100us;
     /**

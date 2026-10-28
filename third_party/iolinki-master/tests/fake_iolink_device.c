@@ -496,9 +496,24 @@ static int fake_iolink_device_send(void* user, const uint8_t* data, size_t len)
     if((data[0] & IOLINK_MC_COMM_CHANNEL_MASK) == IOLINK_MC_CHANNEL_ISDU)
     {
         size_t i;
+        uint8_t flowctrl = (uint8_t)(data[0] & IOLINK_MC_ADDR_MASK);
+
+        if(((data[0] & IOLINK_MC_RW_MASK) != 0U) &&
+           ((flowctrl == IOLINK_FLOWCTRL_IDLE) || (flowctrl == IOLINK_FLOWCTRL_ABORT)))
+        {
+            g_device.isdu_request_len = 0U;
+            g_device.isdu_response_active = false;
+            g_device.isdu_response_len = 0U;
+            g_device.isdu_response_pos = 0U;
+        }
 
         if((data[0] & IOLINK_MC_RW_MASK) == 0U)
         {
+            if(flowctrl == IOLINK_FLOWCTRL_START)
+            {
+                /* A fresh request discards padding left in the last OD block. */
+                g_device.isdu_request_len = 0U;
+            }
             for(i = IOLINK_M_SEQ_HEADER_LEN; i < len; i++)
             {
                 fake_iolink_device_on_master_od(data[i]);
