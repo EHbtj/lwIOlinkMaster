@@ -23,7 +23,7 @@ class Phy{
         MSeqTimeout
     };
 
-    enum class COM_e {
+    enum class COM_e : uint32_t {
         COM1=4800,
         COM2=38400,
         COM3=230400,
@@ -57,6 +57,7 @@ class Phy{
             
         };
    public:
+        virtual ~Phy() = default;
         /**
          * @brief Driver initialization
          * 
@@ -138,8 +139,8 @@ class Phy{
 
 
    protected:
-      Fault_cb m_fault_cb;
-      PLTransferInd_cb m_transferInd_cb;
+      Fault_cb m_fault_cb = nullptr;
+      PLTransferInd_cb m_transferInd_cb = nullptr;
       const uint8_t m_totalPorts;
 };
 

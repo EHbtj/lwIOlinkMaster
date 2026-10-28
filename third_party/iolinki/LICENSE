@@ -1,0 +1,32 @@
+GNU GENERAL PUBLIC LICENSE
+Version 3, 29 June 2007
+
+Copyright (C) 2026 Andrii Shylenko
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+---
+
+ALTERNATIVE COMMERCIAL LICENSE
+
+The GPLv3 grant above is the whole public grant. It includes commercial
+and production use. It has no evaluation period and no field-of-use limit.
+If you distribute a work that incorporates this program, the GPLv3 applies
+to that work.
+
+A separate commercial license is available when you want to distribute a
+proprietary product that incorporates this program and do not want the
+GPLv3 copyleft to apply. That license is an alternative grant. It does not
+limit this one. See LICENSE.COMMERCIAL or contact andrii@shylenko.com.
+

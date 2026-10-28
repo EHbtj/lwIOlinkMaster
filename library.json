@@ -1,6 +1,6 @@
 {
     "name": "lwIOlinkMaster",
-    "version": "0.0.11",
+    "version": "0.1.0",
     "description": "Lightweight IOLink Device library.",
     "keywords": "communication, IO-link, Master, SMI, SDCI",
     "repository":
@@ -22,5 +22,6 @@
     ],
     "license": "GPL-3.0-only",
     "frameworks": "arduino",
-    "platforms": "*"
+    "platforms": "espressif32",
+    "dependencies": {"bblanchon/ArduinoJson": "7.4.3"}
   }

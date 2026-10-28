@@ -1,0 +1,751 @@
+--- a/src/iolinki_master/master.h
++++ b/src/iolinki_master/master.h
+@@ -225,7 +225,8 @@
+     iolink_master_port_mode_t port_mode;   /**< Operating mode (IO-Link/DI/DQ/deactivated). */
+     iolink_master_m_seq_type_t m_seq_type; /**< M-sequence type to drive. */
+     iolink_baudrate_t baudrate;            /**< COM baudrate (start point if auto). */
+-    uint8_t min_cycle_time;                /**< Minimum cycle time (raw octet encoding). */
++    uint16_t min_cycle_time;               /**< Cycle time in 100us units (not wire encoding). */
++    bool auto_configure;                   /**< lwIOlink: discover Page 1 before OPERATE. */
+     uint8_t pd_in_len;                     /**< Configured input process-data length, in bytes. */
+     uint8_t pd_out_len;                    /**< Configured output process-data length, in bytes. */
+     /**
+@@ -324,7 +325,7 @@
+ {
+     bool cycle_timer_valid;           /**< True once the cycle timer has a valid start. */
+     bool awaiting_response;           /**< True while waiting on a device response. */
+-    uint8_t min_cycle_time_100us;     /**< Minimum cycle time, in 100us units. */
++    uint16_t min_cycle_time_100us;    /**< Minimum cycle time, in 100us units. */
+     uint32_t last_cycle_start_100us;  /**< Timestamp of the last cycle start, in 100us units. */
+     uint32_t response_deadline_100us; /**< Response deadline timestamp, in 100us units. */
+ } iolink_master_timing_t;
+@@ -363,10 +364,10 @@
+  * array reference plus port count.
+  */
+ #define IOLINK_MASTER_PORT_STORAGE_BUDGET_SIZE \
+-    1312U /**< Auditing budget for port storage, in bytes. */
++    1408U /**< Auditing budget for port storage, in bytes. */
+ #define IOLINK_MASTER_CONTROLLER_STORAGE_BUDGET_SIZE \
+     32U /**< Auditing budget for controller storage, in bytes. */
+-#define IOLINK_MASTER_PORT_STORAGE_SIZE 1312U /**< Actual port opaque storage size, in bytes. */
++#define IOLINK_MASTER_PORT_STORAGE_SIZE 1408U /**< Actual port opaque storage size, in bytes. */
+ #define IOLINK_MASTER_CONTROLLER_STORAGE_SIZE \
+     32U /**< Actual controller opaque storage size, in bytes. */
+ 
+--- a/src/vendor/iolinki_master/master_internal.h
++++ b/src/vendor/iolinki_master/master_internal.h
+@@ -308,6 +308,20 @@
+      *  M-sequence is answered with [OD][PD-in] CKS, a WRITE with [PD-in] CKS
+      *  (Figures A.9/A.10/A.13/A.14). */
+     bool rx_od_expected;
++    uint8_t direct_page[16]; /* lwIOlink: startup page reads, never ISDU in STARTUP. */
++    uint8_t direct_address;
++    uint8_t cycle_wire;
++    bool configured;
++    bool cycle_written;
++    bool cycle_write_pending;
++    uint32_t exchange_count;
++    uint8_t tx_octets;
++    uint16_t saved_request_pos;
++    uint8_t saved_flowctrl;
++    iolink_master_isdu_phase_t saved_phase;
++    bool isdu_tx_saved;
++    uint32_t isdu_wait_start;
++    bool isdu_wait_timed;
+ } iolink_master_port_state_t;
+ 
+ /** @brief Private controller state backed by ::iolink_master_controller_t storage. */
+@@ -401,7 +415,7 @@
+ {
+     const iolink_master_port_state_t* state = iolink_master_port_const_state(port);
+ 
+-    return state->awaiting_response && (now_100us >= state->response_deadline_100us);
++    return state->awaiting_response && ((int32_t)(now_100us - state->response_deadline_100us) >= 0);
+ }
+ 
+ /** @brief Fill the on-request-data octets of an outgoing frame from ISDU state. */
+--- a/src/vendor/iolinki_master/master_port.c
++++ b/src/vendor/iolinki_master/master_port.c
+@@ -24,6 +24,7 @@
+     IOLINK_BAUDRATE_COM2,
+     IOLINK_BAUDRATE_COM1,
+ };
++static void iolink_master_arm_send_gate(iolink_master_port_t*, uint32_t, uint32_t, bool);
+ 
+ /** @brief Verify the A.1.6 checksum of a TYPE_0 reply @c [OD, CKS].
+  *
+@@ -41,7 +42,7 @@
+  * enabled). */
+ static bool iolink_master_startup_validation_required(const iolink_master_config_t* config)
+ {
+-    return config->validate_device_info ||
++    return config->auto_configure || config->validate_device_info ||
+            (config->inspection_level != IOLINK_MASTER_INSPECTION_NO_CHECK);
+ }
+ 
+@@ -212,6 +213,9 @@
+            bit 7 set) carries OD octets; a WRITE reply is [PD-in] CKS. Record
+            the direction of the frame now on the wire for reply framing. */
+         state->rx_od_expected = od_expected;
++        state->exchange_count++;
++        if (state->state == IOLINK_MASTER_STATE_OPERATE) state->cycle_count++;
++        state->tx_octets = (uint8_t)len;
+         return true;
+     }
+ 
+@@ -228,7 +232,9 @@
+ 
+     if (state->config.wake_up == NULL) {
+         state->tx_buf[0] = IOLINK_MASTER_WAKEUP_BYTE;
+-        return iolink_master_send_full(port, state->tx_buf, 1U);
++        bool sent = iolink_master_send_full(port, state->tx_buf, 1U);
++        if (sent) state->exchange_count--; /* mock fallback WURQ expects no reply */
++        return sent;
+     }
+ 
+     ret = state->config.wake_up();
+@@ -332,6 +338,10 @@
+     }
+ 
+     mc = iolink_master_encode_master_command(read, IOLINK_MASTER_MC_CHANNEL_ISDU, flowctrl);
++    state->saved_request_pos = state->isdu.request_pos;
++    state->saved_phase = state->isdu.phase;
++    state->saved_flowctrl = state->isdu.flowctrl;
++    state->isdu_tx_saved = true;
+     if (read) {
+         /* Response polling/read: the transport advances FlowCTRL without
+            consuming request data. */
+@@ -492,14 +502,14 @@
+     }
+ 
+     if (state->awaiting_response) {
+-        *out_next_100us = (now_100us >= state->response_deadline_100us)
++        *out_next_100us = ((int32_t)(now_100us - state->response_deadline_100us) >= 0)
+                               ? now_100us
+                               : state->response_deadline_100us;
+         return IOLINK_MASTER_STATUS_OK;
+     }
+ 
+     if ((state->state == IOLINK_MASTER_STATE_STARTUP) && state->send_ready_valid &&
+-        (now_100us < state->send_ready_at_100us)) {
++        ((int32_t)(now_100us - state->send_ready_at_100us) < 0)) {
+         /* Waiting T_REN + T_DMT, T_DMT, T_DWU or T_SD before the next startup transmission. */
+         *out_next_100us = state->send_ready_at_100us;
+         return IOLINK_MASTER_STATUS_OK;
+@@ -513,7 +523,7 @@
+ 
+     cycle_due =
+         (uint32_t) (state->last_cycle_start_100us + (uint32_t) state->config.min_cycle_time);
+-    *out_next_100us = (now_100us >= cycle_due) ? now_100us : cycle_due;
++    *out_next_100us = ((int32_t)(now_100us - cycle_due) >= 0) ? now_100us : cycle_due;
+     return IOLINK_MASTER_STATUS_OK;
+ }
+ 
+@@ -524,6 +534,7 @@
+ {
+     iolink_master_port_state_t* state;
+     uint32_t cycle_count_before;
++    uint32_t exchange_before;
+     int rx_ret;
+     int timeout_ret;
+ 
+@@ -531,12 +542,37 @@
+         return IOLINK_MASTER_ERR_INVALID_ARG;
+     }
+ 
++    iolink_master_state_t previous_state = iolink_master_get_state(port);
+     rx_ret = iolink_master_poll_rx(port);
+     if (rx_ret < 0) {
++        iolink_master_port_state_t* s = iolink_master_port_state(port);
++        if (pace_cycles && previous_state != IOLINK_MASTER_STATE_STARTUP &&
++            s->state == IOLINK_MASTER_STATE_STARTUP)
++            iolink_master_arm_send_gate(port, now_100us,
++                s->config.t_dwu_100us ? s->config.t_dwu_100us : IOLINK_MASTER_DEFAULT_T_DWU_100US, true);
+         return rx_ret;
+     }
+ 
+     state = iolink_master_port_state(port);
++    if (pace_cycles && previous_state != state->state && rx_ret > 0 &&
++        (state->state == IOLINK_MASTER_STATE_PREOPERATE || state->state == IOLINK_MASTER_STATE_OPERATE))
++        iolink_master_arm_send_gate(port, now_100us,
++            iolink_master_tbit_to_100us(iolink_master_startup_baudrate(port), 100U), true);
++    if (pace_cycles && state->isdu.op != IOLINK_MASTER_ISDU_OP_NONE && !state->isdu.done &&
++        (state->isdu.phase == IOLINK_MASTER_ISDU_PHASE_WAIT ||
++         state->isdu.phase == IOLINK_MASTER_ISDU_PHASE_RESPONSE)) {
++        if (!state->isdu_wait_timed) {
++            state->isdu_wait_timed = true;
++            state->isdu_wait_start = now_100us;
++        } else if ((uint32_t)(now_100us - state->isdu_wait_start) >=
++                   (state->config.isdu_timeout_100us ? state->config.isdu_timeout_100us : 50000U)) {
++            state->isdu.error = 0x1100U; /* master service timeout */
++            state->isdu.done = true;
++            state->isdu.abort_pending = true;
++            state->isdu.phase = IOLINK_MASTER_ISDU_PHASE_NONE;
++            state->isdu_tx_saved = false;
++        }
++    } else state->isdu_wait_timed = false;
+     if (event == IOLINK_MASTER_TICK_RESPONSE_TIMEOUT) {
+         if (pace_cycles && !state->awaiting_response) {
+             return rx_ret;
+@@ -573,7 +609,21 @@
+     }
+ 
+     cycle_count_before = state->cycle_count;
++    exchange_before = state->exchange_count;
+     iolink_master_process_at(port, now_100us, pace_cycles);
++
++    /* Every request, including Page reads, writes and ISDU, owns a deadline.
++       The adapter send is synchronous, so include the complete TX and RX wire time. */
++    if (pace_cycles && state->exchange_count != exchange_before) {
++        uint32_t rx = state->state == IOLINK_MASTER_STATE_OPERATE
++            ? state->pd_in_len + (state->rx_od_expected ? state->od_len : 0U) + 1U
++            : (state->rx_od_expected ? 2U : 1U);
++        uint32_t bits = state->tx_octets * 12U + rx * 14U + 10U;
++        uint32_t window = iolink_master_tbit_to_100us(iolink_master_startup_baudrate(port), bits) + 2U;
++        if (window < state->config.response_timeout_100us) window = state->config.response_timeout_100us;
++        state->response_deadline_100us = now_100us + window;
++        state->awaiting_response = true;
++    }
+ 
+     /* iolink_master_process() increments cycle_count through the port pointer on a
+        successful operate send; cppcheck does not model that side effect. */
+@@ -590,8 +640,7 @@
+         }
+ 
+         state->last_cycle_start_100us = now_100us;
+-        state->response_deadline_100us =
+-            (uint32_t) (now_100us + (uint32_t) iolink_master_response_timeout_100us(port));
++
+         state->cycle_timer_valid = true;
+         state->awaiting_response = true;
+     }
+@@ -624,6 +673,7 @@
+     /* No DeviceStatus has been read yet; the failure sentinel matches the NULL-port contract. */
+     iolink_master_port_state(port)->diagnostics.device_status = IOLINK_DEVICE_STATUS_FAILURE;
+     iolink_master_port_state(port)->startup.baudrate_index = 0U;
++    iolink_master_port_state(port)->direct_address = 2U;
+     iolink_master_port_state(port)->state = (config->port_mode == IOLINK_MASTER_PORT_MODE_IOLINK)
+                                                 ? IOLINK_MASTER_STATE_STARTUP
+                                                 : IOLINK_MASTER_STATE_INACTIVE;
+@@ -803,6 +853,15 @@
+     state->startup.wake_attempts = 0U;
+     state->diagnostics.rx_retry_count = 0U;
+     state->awaiting_response = false;
++    state->device_info.valid = false;
++    state->pd_valid = false;
++    state->configured = false;
++    state->cycle_written = false;
++    state->cycle_write_pending = false;
++    state->direct_address = 2U;
++    memset(&state->isdu, 0, sizeof(state->isdu));
++    state->isdu_tx_saved = false;
++    state->isdu_wait_timed = false;
+     ret = iolink_master_reset_rate_scan(port);
+     if (ret != IOLINK_MASTER_STATUS_OK) {
+         state->state = IOLINK_MASTER_STATE_ERROR;
+@@ -887,8 +946,16 @@
+     }
+ 
+     if (iolink_master_port_state(port)->state != IOLINK_MASTER_STATE_STARTUP) {
+-        if (iolink_master_port_state(port)->state == IOLINK_MASTER_STATE_OPERATE) {
++        if (iolink_master_port_state(port)->state == IOLINK_MASTER_STATE_OPERATE ||
++            iolink_master_port_state(port)->state == IOLINK_MASTER_STATE_PREOPERATE) {
+             iolink_master_port_state(port)->diagnostics.response_timeouts++;
++            iolink_master_port_state_t* s = iolink_master_port_state(port);
++            if (s->isdu_tx_saved) {
++                s->isdu.request_pos = s->saved_request_pos;
++                s->isdu.phase = s->saved_phase;
++                s->isdu.flowctrl = s->saved_flowctrl;
++                s->isdu_tx_saved = false;
++            }
+             if (iolink_master_port_state(port)->diagnostics.rx_retry_count <
+                 IOLINK_MASTER_RX_RETRY_LIMIT) {
+                 iolink_master_port_state(port)->diagnostics.rx_retry_count++;
+@@ -938,7 +1005,6 @@
+ void iolink_master_process_at(iolink_master_port_t* port, uint32_t now_100us, bool timed)
+ {
+     int frame_len;
+-    size_t od_pos;
+ 
+     if ((port == NULL) || (iolink_master_port_state(port)->phy == NULL) ||
+         (iolink_master_port_state(port)->phy->send == NULL)) {
+@@ -946,7 +1012,7 @@
+     }
+ 
+     if (timed && iolink_master_port_state(port)->send_ready_valid &&
+-        (now_100us < iolink_master_port_state(port)->send_ready_at_100us)) {
++        ((int32_t)(now_100us - iolink_master_port_state(port)->send_ready_at_100us) < 0)) {
+         /* Table 42 / Table 10: hold off until T_REN + T_DMT, T_DMT, T_DWU or T_SD elapsed. */
+         return;
+     }
+@@ -1006,6 +1072,63 @@
+     if (iolink_master_port_state(port)->state == IOLINK_MASTER_STATE_PREOPERATE) {
+         int ret;
+ 
++        /* lwIOlink: the device is still in wire STARTUP here. Read Page 1
++           using Type-0 PAGE requests, not an ISDU service (not yet available). */
++        iolink_master_port_state_t* s = iolink_master_port_state(port);
++        if (s->config.auto_configure && !s->cycle_written) {
++            if (s->direct_address < 16U) {
++                frame_len = iolink_frame_encode_type0((uint8_t)(0xA0U | s->direct_address),
++                                                     s->tx_buf, sizeof(s->tx_buf));
++            } else {
++                if (!s->configured) {
++                    ret = iolink_master_apply_direct_parameter_page1(port, s->direct_page, 16U);
++                    if (ret == 0) ret = iolink_master_select_config_from_device_info(&s->device_info, &s->config);
++                    /* Initial sensor-only slice: streaming Type 0/2, no PD output.
++                       Reject interleaved Type 1 and OD widths not exercised here. */
++                    if (ret == 0 && (s->device_info.pd_out_len != 0U ||
++                        s->device_info.revision_id != 0x11U ||
++                        (s->device_info.min_cycle_time & 0xC0U) == 0xC0U ||
++                        s->device_info.min_cycle_time_100us == 0U ||
++                        (s->device_info.operate_mseq_code != 0U &&
++                         s->device_info.operate_mseq_code != 4U &&
++                         s->device_info.operate_mseq_code != 5U) ||
++                        (s->device_info.operate_mseq_code == 0U && s->device_info.pd_in_len > 2U))) ret = -20;
++                    if (ret == 0 && ((s->device_info.operate_mseq_code == 4U && s->device_info.pd_in_len < 3U) ||
++                        (s->device_info.operate_mseq_code == 5U && s->device_info.pd_in_len == 0U))) ret = -20;
++                    if (ret != 0) {
++                        s->diagnostics.last_service_result = ret;
++                        s->state = IOLINK_MASTER_STATE_ERROR;
++                        return;
++                    }
++                    s->od_len = s->device_info.operate_mseq_code == 5U ? 2U : 1U;
++                    s->pd_in_len = s->config.pd_in_len;
++                    s->pd_out_len = 0U;
++                    /* Choose at least the full wire time plus task scheduling margin,
++                       and at least 2ms. Round UP to a representable MasterCycleTime. */
++                    uint32_t minimum = iolink_master_tbit_to_100us(iolink_master_startup_baudrate(port),
++                        (3U + s->od_len + s->pd_in_len) * 14U + 10U) + 10U;
++                    if (minimum < 20U) minimum = 20U;
++                    if (minimum < s->config.min_cycle_time) minimum = s->config.min_cycle_time;
++                    unsigned code;
++                    for (code = 1U; code < 192U; ++code)
++                        if (iolink_master_decode_min_cycle_time_100us((uint8_t)code) >= minimum) break;
++                    if (code == 192U) {
++                        s->diagnostics.last_service_result = -21;
++                        s->state = IOLINK_MASTER_STATE_ERROR;
++                        return;
++                    }
++                    s->cycle_wire = (uint8_t)code;
++                    s->config.min_cycle_time = iolink_master_decode_min_cycle_time_100us(s->cycle_wire);
++                    s->configured = true;
++                }
++                frame_len = iolink_frame_encode_type0_write(0x21U, s->cycle_wire,
++                                                            s->tx_buf, sizeof(s->tx_buf));
++                s->cycle_write_pending = true;
++            }
++            if (frame_len > 0) (void)iolink_master_send_full(port, s->tx_buf, (size_t)frame_len);
++            return;
++        }
++
+         if (iolink_master_send_event(port)) {
+             return;
+         }
+@@ -1064,49 +1187,13 @@
+             return;
+         }
+ 
+-        if ((iolink_master_port_state(port)->config.m_seq_type == IOLINK_MASTER_M_SEQ_TYPE_0) &&
+-            (iolink_master_port_state(port)->config.pd_in_len == 0U) &&
+-            (iolink_master_port_state(port)->pd_out_len == 0U)) {
+-            uint8_t od = 0U;
+-            iolink_master_isdu_fill_od(port, &od, 1U);
+-            frame_len = iolink_frame_encode_type0(od, iolink_master_port_state(port)->tx_buf,
+-                                                  sizeof(iolink_master_port_state(port)->tx_buf));
+-            if (frame_len > 0) {
+-                if (iolink_master_send_full(port, iolink_master_port_state(port)->tx_buf,
+-                                            (size_t) frame_len)) {
+-                    iolink_master_port_state(port)->cycle_count++;
+-                }
+-            }
+-            return;
+-        }
+-
+-        /* A.2.3/A.2.4: a TYPE_1/TYPE_2 master message is MC, CKT, PD-out, OD; the
+-           CKT carries the M-sequence type in bits 6-7 and the A.1.6 checksum in
+-           bits 0-5 (there is no trailing checksum octet in the request). */
+-        frame_len = (int) (IOLINK_M_SEQ_HEADER_LEN + iolink_master_port_state(port)->pd_out_len +
+-                           iolink_master_port_state(port)->od_len);
+-        iolink_master_port_state(port)->tx_buf[0] =
+-            iolink_master_encode_master_command(false, IOLINK_MASTER_MC_CHANNEL_PROCESS, 0U);
+-        iolink_master_port_state(port)->tx_buf[1] = 0x00U;
+-        od_pos = (size_t) IOLINK_M_SEQ_HEADER_LEN + iolink_master_port_state(port)->pd_out_len;
+-        if (iolink_master_port_state(port)->pd_out_len > 0U) {
+-            (void) memcpy(&iolink_master_port_state(port)->tx_buf[IOLINK_M_SEQ_HEADER_LEN],
+-                          iolink_master_port_state(port)->pd_out,
+-                          iolink_master_port_state(port)->pd_out_len);
+-        }
+-        iolink_master_isdu_fill_od(port, &iolink_master_port_state(port)->tx_buf[od_pos],
+-                                   iolink_master_port_state(port)->od_len);
+-        /* A.1.6: type bits in place, checksum bits zero, then fold the checksum in. */
+-        iolink_master_port_state(port)->tx_buf[1] =
+-            iolink_master_ckt_type_bits(iolink_master_port_state(port)->config.m_seq_type);
+-        iolink_master_port_state(port)->tx_buf[1] =
+-            (uint8_t) (iolink_master_port_state(port)->tx_buf[1] |
+-                       iolink_checksum6(iolink_master_port_state(port)->tx_buf, (size_t) frame_len));
+-
+-        if (iolink_master_send_full(port, iolink_master_port_state(port)->tx_buf,
+-                                    (size_t) frame_len)) {
+-            iolink_master_port_state(port)->cycle_count++;
+-        }
++        /* A cyclic READ of ISDU IDLE is side-effect free and also carries PD.
++           Devices without ISDU use a PAGE read of RevisionID instead. */
++        iolink_master_port_state_t* s = iolink_master_port_state(port);
++        uint8_t mc = s->device_info.isdu_supported ? 0xF1U : 0xA4U;
++        frame_len = iolink_master_build_isdu_frame(port, mc, NULL,
++            s->config.m_seq_type != IOLINK_MASTER_M_SEQ_TYPE_0);
++        if (frame_len > 0) (void)iolink_master_send_full(port, s->tx_buf, (size_t)frame_len);
+     }
+ }
+ 
+@@ -1132,8 +1219,7 @@
+         expected_len = IOLINK_M_SEQ_TYPE0_LEN;
+     }
+     else if (iolink_master_port_state(port)->state == IOLINK_MASTER_STATE_PREOPERATE) {
+-        expected_len = (iolink_master_port_state(port)->startup.step ==
+-                        IOLINK_MASTER_STARTUP_STEP_AWAIT_OPERATE_ACK)
++        expected_len = (!iolink_master_port_state(port)->rx_od_expected)
+                            ? 1U
+                            : IOLINK_M_SEQ_TYPE0_LEN;
+     }
+@@ -1143,9 +1229,7 @@
+            port (no PD) keeps its established two-octet expectation: its
+            replies are framed by the TYPE_0 branch of iolink_master_on_rx. */
+         const iolink_master_port_state_t* state = iolink_master_port_const_state(port);
+-        const bool type0_operate = (state->config.m_seq_type == IOLINK_MASTER_M_SEQ_TYPE_0) &&
+-                                   (state->config.pd_in_len == 0U) && (state->pd_out_len == 0U);
+-        const uint8_t od_octets = (type0_operate || state->rx_od_expected) ? state->od_len : 0U;
++        const uint8_t od_octets = state->rx_od_expected ? state->od_len : 0U;
+         expected_len = (uint8_t) (state->config.pd_in_len + od_octets + 1U);
+     }
+     else {
+@@ -1253,6 +1337,25 @@
+         return IOLINK_MASTER_STATUS_OK;
+     }
+ 
++    if (iolink_master_port_state(port)->state == IOLINK_MASTER_STATE_PREOPERATE &&
++        iolink_master_port_state(port)->config.auto_configure &&
++        !iolink_master_port_state(port)->cycle_written) {
++        iolink_master_port_state_t* s = iolink_master_port_state(port);
++        uint8_t msg[2] = {data[0], 0U};
++        uint8_t expected = s->cycle_write_pending ? 1U : 2U;
++        if (len != expected) return IOLINK_MASTER_ERR_FRAME;
++        msg[expected - 1U] = data[expected - 1U] & 0xC0U;
++        if (iolink_checksum6(msg, expected) != (data[expected - 1U] & 0x3FU)) {
++            s->diagnostics.checksum_errors++;
++            return IOLINK_MASTER_ERR_CHECKSUM;
++        }
++        s->awaiting_response = false;
++        s->diagnostics.rx_retry_count = 0U;
++        if (s->cycle_write_pending) { s->cycle_write_pending = false; s->cycle_written = true; }
++        else s->direct_page[s->direct_address++] = data[0];
++        return 0;
++    }
++
+     if ((iolink_master_port_state(port)->state == IOLINK_MASTER_STATE_PREOPERATE) &&
+         (iolink_master_port_state(port)->startup.step ==
+          IOLINK_MASTER_STARTUP_STEP_AWAIT_OPERATE_ACK)) {
+@@ -1309,7 +1412,8 @@
+     if ((iolink_master_port_state(port)->state == IOLINK_MASTER_STATE_OPERATE) &&
+         (iolink_master_port_state(port)->config.m_seq_type == IOLINK_MASTER_M_SEQ_TYPE_0) &&
+         (iolink_master_port_state(port)->config.pd_in_len == 0U) &&
+-        (iolink_master_port_state(port)->pd_out_len == 0U)) {
++        (iolink_master_port_state(port)->pd_out_len == 0U) &&
++        iolink_master_port_state(port)->rx_od_expected) {
+         if (len != IOLINK_M_SEQ_TYPE0_LEN) {
+             return IOLINK_MASTER_ERR_FRAME;
+         }
+@@ -1360,6 +1464,7 @@
+     iolink_master_port_state(port)->diagnostics.rx_retry_count = 0U;
+     iolink_master_port_state(port)->awaiting_response = false;
+     iolink_master_port_state(port)->diagnostics.od_status = resp.status;
++    iolink_master_port_state(port)->isdu_tx_saved = false;
+ 
+     /*
+      * Dispatch on the rising edge of the OD Event flag. This turns event
+@@ -1374,6 +1479,7 @@
+     }
+     iolink_master_port_state(port)->diagnostics.event_pending = resp.event_pending;
+ 
++    iolink_master_port_state(port)->pd_valid = resp.pd_valid;
+     if (resp.pd_valid) {
+         (void) memcpy(iolink_master_port_state(port)->pd_in, resp.pd, resp.pd_len);
+         iolink_master_port_state(port)->pd_in_len = resp.pd_len;
+--- a/src/vendor/iolinki_master/master_isdu.c
++++ b/src/vendor/iolinki_master/master_isdu.c
+@@ -58,6 +58,8 @@
+ static void iolink_master_isdu_start(iolink_master_port_t* port, iolink_master_isdu_op_t op,
+                                      uint16_t index, uint8_t subindex)
+ {
++    iolink_master_port_state(port)->diagnostics.last_isdu_error = 0;
++    iolink_master_port_state(port)->isdu_wait_timed = false;
+     iolink_master_port_state(port)->isdu.op = op;
+     iolink_master_port_state(port)->isdu.phase = IOLINK_MASTER_ISDU_PHASE_REQUEST;
+     iolink_master_port_state(port)->isdu.index = index;
+@@ -92,11 +94,13 @@
+ 
+     if (iolink_master_port_state(port)->isdu.error != IOLINK_ISDU_ERROR_NONE) {
+         bool aborted = iolink_master_port_state(port)->isdu.abort_pending;
++        bool idle = iolink_master_port_state(port)->isdu.idle_pending;
+ 
+         iolink_master_port_state(port)->diagnostics.last_isdu_error =
+             iolink_master_port_state(port)->isdu.error;
+         iolink_master_isdu_clear(port);
+         iolink_master_port_state(port)->isdu.abort_pending = aborted;
++        iolink_master_port_state(port)->isdu.idle_pending = idle;
+         return iolink_master_service_result(port, IOLINK_MASTER_ISDU_ERR_DEVICE);
+     }
+ 
+@@ -110,7 +114,9 @@
+     }
+     /* Guarded above by `*len < result_len`, so result_len fits in the uint8 out-length. */
+     *len = (uint8_t) result_len;
++    bool idle_pending = iolink_master_port_state(port)->isdu.idle_pending;
+     iolink_master_isdu_clear(port);
++    iolink_master_port_state(port)->isdu.idle_pending = idle_pending;
+     return iolink_master_service_result(port, IOLINK_MASTER_STATUS_OK);
+ }
+ 
+@@ -119,15 +125,19 @@
+ {
+     if (iolink_master_port_state(port)->isdu.error != IOLINK_ISDU_ERROR_NONE) {
+         bool aborted = iolink_master_port_state(port)->isdu.abort_pending;
++        bool idle = iolink_master_port_state(port)->isdu.idle_pending;
+ 
+         iolink_master_port_state(port)->diagnostics.last_isdu_error =
+             iolink_master_port_state(port)->isdu.error;
+         iolink_master_isdu_clear(port);
+         iolink_master_port_state(port)->isdu.abort_pending = aborted;
++        iolink_master_port_state(port)->isdu.idle_pending = idle;
+         return iolink_master_service_result(port, IOLINK_MASTER_ISDU_ERR_DEVICE);
+     }
+ 
++    bool idle_pending = iolink_master_port_state(port)->isdu.idle_pending;
+     iolink_master_isdu_clear(port);
++    iolink_master_port_state(port)->isdu.idle_pending = idle_pending;
+     return iolink_master_service_result(port, IOLINK_MASTER_STATUS_OK);
+ }
+ 
+@@ -254,6 +264,14 @@
+     }
+ 
+     service = (uint8_t) (isdu->response[0] >> IOLINK_MASTER_ISDU_SERVICE_SHIFT);
++
++    if ((service != 0x4U && service != 0xCU) &&
++        service != (isdu->op == IOLINK_MASTER_ISDU_OP_READ ? 0xDU : 0x5U)) {
++        isdu->error = 0x5700U; /* unexpected I-Service */
++        isdu->done = true; isdu->abort_pending = true;
++        isdu->phase = IOLINK_MASTER_ISDU_PHASE_NONE;
++        return;
++    }
+ 
+     if ((service == 0x4U) || (service == 0xCU)) {
+         /* Table A.13: negative responses carry ErrorType = ErrorCode, AdditionalCode. */
+@@ -340,6 +358,13 @@
+                     continue; /* Need ExtLength to know the total length (A.5.3). */
+                 }
+                 isdu->expected_len = isdu->response[1];
++                if (isdu->expected_len < IOLINK_MASTER_ISDU_EXT_MIN ||
++                    isdu->expected_len > IOLINK_MASTER_ISDU_EXT_MAX) {
++                    isdu->error = 0x5700U;
++                    isdu->done = true; isdu->abort_pending = true;
++                    isdu->phase = IOLINK_MASTER_ISDU_PHASE_NONE;
++                    return;
++                }
+             }
+             else {
+                 /* Length 0 is only a protocol "no service" octet, handled above. */
+--- a/src/vendor/iolinki_master/master_parameters.c
++++ b/src/vendor/iolinki_master/master_parameters.c
+@@ -369,9 +369,7 @@
+      * 25.5 ms cannot be paced by this field and will subsequently fail
+      * validation, which is the honest outcome rather than silently wrapping.
+      */
+-    config->min_cycle_time = (info->min_cycle_time_100us > (uint16_t) UINT8_MAX)
+-                                 ? UINT8_MAX
+-                                 : (uint8_t) info->min_cycle_time_100us;
++    config->min_cycle_time = info->min_cycle_time_100us;
+     config->pd_in_len = info->pd_in_len;
+     config->pd_out_len = info->pd_out_len;
+ 
+--- a/third_party/iolinki-master/tests/fake_iolink_device.c
++++ b/third_party/iolinki-master/tests/fake_iolink_device.c
+@@ -8,9 +8,9 @@
+ #include <stddef.h>
+ #include <string.h>
+ 
+-#define FAKE_IOLINK_DEVICE_OBJECT_MAX_LEN 16U
++#define FAKE_IOLINK_DEVICE_OBJECT_MAX_LEN 232U
+ #define FAKE_IOLINK_DEVICE_OBJECT_MAX_COUNT 4U
+-#define FAKE_IOLINK_DEVICE_ISDU_REQUEST_MAX_LEN 80U
++#define FAKE_IOLINK_DEVICE_ISDU_REQUEST_MAX_LEN 238U
+ 
+ /* Coarse link state, used to disambiguate the startup probe (a page-channel
+    Type-0 read seen only once, right after wake-up) from later PREOPERATE ISDU
+@@ -34,7 +34,7 @@
+     uint8_t pd_in_len;
+     uint8_t od_len;
+     bool event_pending;
+-    uint8_t rx_queue[16];
++    uint8_t rx_queue[128];
+     uint8_t rx_len;
+     uint8_t rx_pos;
+     uint8_t link_state;
+@@ -45,13 +45,14 @@
+     bool drop_next_response;
+     bool truncate_next_response;
+     bool keep_unread_responses;
++    bool busy_response, malformed_response, invalid_pd;
+     fake_iolink_device_object_t objects[FAKE_IOLINK_DEVICE_OBJECT_MAX_COUNT];
+     uint8_t object_count;
+     uint8_t isdu_request[FAKE_IOLINK_DEVICE_ISDU_REQUEST_MAX_LEN];
+     uint8_t isdu_request_len;
+     bool isdu_request_expect_data;
+     bool isdu_request_last_control;
+-    uint8_t isdu_response[128];
++    uint8_t isdu_response[238];
+     uint8_t isdu_response_len;
+     uint8_t isdu_response_pos;
+     bool isdu_response_active;
+@@ -129,6 +130,12 @@
+ /** @brief Build a positive Read Response (+) carrying @p data (Table A.13). */
+ static void fake_iolink_device_prepare_isdu_read_data(const uint8_t* data, uint8_t len)
+ {
++    if(g_device.malformed_response) {
++        g_device.isdu_response[0]=0xd1; g_device.isdu_response[1]=1;
++        g_device.isdu_response[2]=0xd0; /* valid XOR but illegal ExtLength */
++        g_device.isdu_response_len=3; g_device.isdu_response_pos=0;
++        g_device.isdu_response_active=true; return;
++    }
+     uint16_t total = (uint16_t)(1U + len + 1U);
+ 
+     if(total <= 15U)
+@@ -161,6 +168,7 @@
+     uint8_t index_len;
+     uint8_t payload_start;
+     uint8_t payload_len;
++    uint8_t offset;
+     fake_iolink_device_object_t* object;
+ 
+     if(g_device.isdu_request_len < 2U)
+@@ -171,6 +179,7 @@
+ 
+     service = (uint8_t)(g_device.isdu_request[0] >> 4);
+     index_len = (uint8_t)(service & 0x07U);
++    offset = (g_device.isdu_request[0] & 0x0fU) == 1U ? 2U : 1U;
+ 
+     if((index_len == 0U) || (g_device.isdu_request_len < (uint8_t)(2U + index_len)))
+     {
+@@ -180,18 +189,18 @@
+ 
+     if(index_len == 1U)
+     {
+-        index = g_device.isdu_request[1];
++        index = g_device.isdu_request[offset];
+         subindex = 0U;
+     }
+     else if(index_len == 2U)
+     {
+-        index = g_device.isdu_request[1];
+-        subindex = g_device.isdu_request[2];
++        index = g_device.isdu_request[offset];
++        subindex = g_device.isdu_request[offset+1U];
+     }
+     else
+     {
+-        index = (uint16_t)(((uint16_t)g_device.isdu_request[1] << 8) | g_device.isdu_request[2]);
+-        subindex = g_device.isdu_request[3];
++        index = (uint16_t)(((uint16_t)g_device.isdu_request[offset] << 8) | g_device.isdu_request[offset+1U]);
++        subindex = g_device.isdu_request[offset+2U];
+     }
+ 
+     /* Accept the spec Table A.12 read I-Service codes (0x9/0xA/0xB). */
+@@ -214,7 +223,7 @@
+         uint8_t total = g_device.isdu_request_len;
+ 
+         /* A.5.6: the last octet is CHKPDU. */
+-        payload_start = (uint8_t)(1U + index_len);
++        payload_start = (uint8_t)(offset + index_len);
+         payload_len = (uint8_t)(total - payload_start - 1U);
+         if(payload_len > FAKE_IOLINK_DEVICE_OBJECT_MAX_LEN)
+         {
+@@ -279,6 +288,7 @@
+ /** @brief Return the next octet of the staged ISDU response stream (0 when idle). */
+ static uint8_t fake_iolink_device_next_response_od(void)
+ {
++    if(g_device.busy_response) return 0;
+     uint8_t od;
+ 
+     if(!g_device.isdu_response_active || (g_device.isdu_response_pos >= g_device.isdu_response_len))
+@@ -374,7 +384,8 @@
+     }
+ 
+     /* A.1.5: CKS carries the Event flag in bit 7 (0x80). */
+-    g_device.rx_queue[pos] = (uint8_t)(g_device.event_pending ? 0x80U : 0U);
++    g_device.rx_queue[pos] = (uint8_t)((g_device.event_pending ? 0x80U : 0U) |
++                                     (g_device.invalid_pd ? 0x40U : 0U));
+     g_device.rx_queue[pos] =
+         (uint8_t)(iolink_checksum6(&g_device.rx_queue[start], (size_t)(pos + 1U - start)) |
+                   g_device.rx_queue[pos]);
+@@ -457,6 +468,8 @@
+     if((len == 1U) && (data[0] == 0x55U))
+     {
+         g_device.wakeup_count++;
++        g_device.link_state = FAKE_LINK_STARTUP;
++        g_device.isdu_request_len = 0;
+         return (int)len;
+     }
+ 
+@@ -496,6 +509,7 @@
+            read M-sequence delivers response octets. */
+         if(g_device.link_state == FAKE_LINK_OPERATE)
+         {
++            g_device.operate_cycle_count++;
+             fake_iolink_device_queue_operate_response((data[0] & IOLINK_MC_RW_MASK) != 0U);
+         }
+         else
+@@ -509,6 +523,12 @@
+ 
+     /* Spec DeviceOperate: Type-0 WRITE of MasterCommand 0x99 to Direct Parameter
+        address 0x00 on the page channel (MC 0x20). Establishes communication. */
++    if(len == 3U && data[0] == 0x21U) {
++        g_device.rx_pos = 0; g_device.rx_len = 1;
++        uint8_t flags = 0;
++        g_device.rx_queue[0] = iolink_checksum6(&flags, 1);
++        return (int)len;
++    }
+     if((len == IOLINK_M_SEQ_MIN_LEN) && (data[0] == 0x20U) &&
+        (data[IOLINK_M_SEQ_HEADER_LEN] == IOLINK_CMD_DEVICE_OPERATE))
+     {
+@@ -528,7 +548,7 @@
+         /* Startup probe (spec T1): the first Type-0 frame after wake-up is a page-
+            channel READ of a Direct Parameter octet. Answer it from the Direct
+            Parameter page rather than treating it as ISDU traffic. */
+-        if((g_device.link_state == FAKE_LINK_STARTUP) &&
++          if((g_device.link_state != FAKE_LINK_OPERATE) &&
+            ((data[0] & IOLINK_MC_RW_MASK) != 0U) &&
+            ((data[0] & IOLINK_MC_COMM_CHANNEL_MASK) == 0x20U))
+         {
+@@ -692,6 +712,9 @@
+ {
+     return &g_phy;
+ }
++void fake_iolink_device_busy(bool enabled) { g_device.busy_response=enabled; }
++void fake_iolink_device_malformed_isdu(bool enabled) { g_device.malformed_response=enabled; }
++void fake_iolink_device_invalid_pd(bool enabled) { g_device.invalid_pd=enabled; }
+ 
+ uint32_t fake_iolink_device_wakeup_count(void)
+ {
+--- a/third_party/iolinki-master/tests/fake_iolink_device.h
++++ b/third_party/iolinki-master/tests/fake_iolink_device.h
+@@ -30,6 +30,9 @@
+ /** @brief Drop all queued (read and unread) reply bytes, like a PHY RX flush. */
+ void fake_iolink_device_flush_rx(void);
+ const iolink_phy_api_t* fake_iolink_device_phy(void);
++void fake_iolink_device_busy(bool enabled);
++void fake_iolink_device_malformed_isdu(bool enabled);
++void fake_iolink_device_invalid_pd(bool enabled);
+ uint32_t fake_iolink_device_wakeup_count(void);
+ uint32_t fake_iolink_device_transition_count(void);
+ uint32_t fake_iolink_device_operate_cycle_count(void);

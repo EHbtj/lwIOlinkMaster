@@ -1,0 +1,7 @@
+* whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+# Preserve the vendored upstream files' blank EOFs and unified-diff context spacing.
+src/iolinki/** whitespace=-blank-at-eof,cr-at-eol
+src/iolinki_master/** whitespace=-blank-at-eof,cr-at-eol
+src/vendor/** whitespace=-blank-at-eof,cr-at-eol
+third_party/** whitespace=-blank-at-eof,cr-at-eol
+third_party/*.patch -whitespace

@@ -1,5 +1,7 @@
 #pragma once
 #include "port.hpp"
+#include "SinglePort.hpp"
+#include "UsbProtocol.hpp"
 #include "driver/phy/phy_driver.hpp"
 #include "driver/phy/tiol112/tiol112.hpp"
 
