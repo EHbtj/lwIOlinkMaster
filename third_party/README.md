@@ -29,6 +29,16 @@ IO-Link silicon here.
   1408 bytes. ABI compatibility with the upstream opaque storage is not claimed.
 - Every request owns a response deadline covering TX plus RX, not just a single
   character. ISDU cycles are paced too. Deadline comparisons handle wraparound.
+- Every wire-STARTUP access, including retries, observes at least 100 T_BIT
+  between request starts, with one extra tick for timestamp quantization.
+  The scheduler exposes this gate during the parameter configuration phase too.
+- Auto-configuration sends MasterIdent after reading communication parameters
+  0x02..0x06 and checks its CKS-only acknowledgement before reading device identity.
+  Link recovery resets this handshake; missing/corrupt acknowledgements are retried.
+- The PHY receive contract adds `IOLINK_PHY_RX_ERROR` (-2) for recoverable UART
+  errors. The TIOL112 adapter distinguishes these from hardware faults (-1).
+  Corrupt input invalidates PD, is flushed, and uses the response-deadline retry
+  path (including ISDU cursor restoration), then re-establishes the link if needed.
 - Recovering a lost link invalidates identity, PD, configuration and the ISDU
   transaction. The new link performs fresh capability discovery.
 - Retries restore the outgoing ISDU cursor. Service response watchdog, illegal

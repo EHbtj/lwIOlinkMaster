@@ -9,6 +9,7 @@ import hashlib
 
 root = Path(__file__).resolve().parents[1]
 paths = [
+    "src/iolinki/phy.h",
     "src/iolinki_master/master.h",
     "src/vendor/iolinki_master/master_internal.h",
     "src/vendor/iolinki_master/master_port.c",

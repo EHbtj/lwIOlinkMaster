@@ -3,6 +3,41 @@
 日付: 2026-10-26。**ソフトウェア試験済み、実機通信・電気特性・適合性は未検証**。
 商用センサーは未選定で、TIOX1X2XEVMや接続先機器の購入・接続は行っていません。
 
+## 2026-10-28 高優先度レビュー指摘の修正
+
+起動中の要求間隔、UART受信異常からの復帰、MasterIdent未送信の3点を修正しました。
+実機での相互運用性・波形は引き続き未検証です。
+
+- 起動時の全要求と再送を100 T_BIT以上の間隔に制限し、100µs時刻の丸めに対して1 tickを加算。
+  パラメータ取得中も次回送信可能時刻をスケジューラーへ通知します。
+- 自動設定では通信パラメータ0x02～0x06を読んだ後、MasterIdent (0x95)を送信。
+  CKSのみの応答を検証するまで機器識別の読出し・周期設定・OPERATEへ進みません。
+  リンクを再確立した場合も同じ手順をやり直します。
+- TIOL112のUARTパリティ／フレーミング／バッファ異常は、一時的な受信エラーとして破棄・再送。
+  再送上限を超えた場合はリンクを再確立します。nFAULTやドライバー障害はERRORで停止します。
+  外部PHYアダプターでは、復帰可能な受信異常に`IOLINK_PHY_RX_ERROR` (-2)を返してください。
+  その他の負値は従来どおりハードウェア／ドライバー障害として扱います。
+
+`tests/startup_recovery.cpp`に7項目を追加しました。既存の`integration`と合わせてCTestは8項目です。
+
+| 追加項目 | 確認内容 |
+| --- | --- |
+| timing | COM1/2/3で要求開始間隔、MasterIdentの応答確認、32bit時刻周回 |
+| ident_retries | MasterIdent応答の欠落・チェックサム破損からの再送。全COM速度で確認 |
+| scan_errors | 異なるCOM速度でUART異常が発生しても探索を続け、1回のWake-upで確立 |
+| transient_errors | Page読出し・MasterIdent・周期通信中のUART異常から復帰。異常直後のPD無効化 |
+| repeated_errors | UART異常が続くと2回再送後に再確立。古いPD・機器情報の無効化とMasterIdentの再実行 |
+| partial_isdu_errors | ISDU要求・応答の途中でUART異常を注入し、同一フレームの再送とデータ取得を確認 |
+| fatal_error | 恒久的なPHY障害では送信停止し、明示的なstartで再開 |
+
+2026-10-28の修正後検証ではCTest 8/8が成功しました。Arduino-ESP32 3.3.11 / ArduinoJson 7.4.3で、
+XIAO ESP32C3（スケッチ320,668バイト、静的RAM14,640バイト）とESP32-S3
+（スケッチ335,602バイト、静的RAM23,616バイト）のビルドが成功しました。
+
+規格根拠は[IO-Link Interface and System Specification V1.1.3](https://io-link.com/fileadmin/user_upload/Downloads/Package_2020/IOL-Interface-Spec_10002_V113_Jun19.pdf)の
+A.2.6/A.3.9、A.4.1、9.2.3.3 Table 86 T21、B.1.2です。
+レビューで指摘した中優先度のISDUタイマー・完了IDLE・拡張長境界は今回の修正対象に含めていません。
+
 ## 実行環境
 
 - Arduino CLI、ローカルに導入されていたArduino-ESP32 3.3.11、ArduinoJson 7.4.3。

@@ -508,9 +508,9 @@ int iolink_master_get_next_tick_time(const iolink_master_port_t* port, uint32_t 
         return IOLINK_MASTER_STATUS_OK;
     }
 
-    if ((state->state == IOLINK_MASTER_STATE_STARTUP) && state->send_ready_valid &&
+    if (state->send_ready_valid &&
         ((int32_t)(now_100us - state->send_ready_at_100us) < 0)) {
-        /* Waiting T_REN + T_DMT, T_DMT, T_DWU or T_SD before the next startup transmission. */
+        /* Also honor T_initcyc between the wire-STARTUP parameter accesses. */
         *out_next_100us = state->send_ready_at_100us;
         return IOLINK_MASTER_STATUS_OK;
     }
@@ -555,9 +555,10 @@ static int iolink_master_tick_common(iolink_master_port_t* port, iolink_master_t
 
     state = iolink_master_port_state(port);
     if (pace_cycles && previous_state != state->state && rx_ret > 0 &&
-        (state->state == IOLINK_MASTER_STATE_PREOPERATE || state->state == IOLINK_MASTER_STATE_OPERATE))
+        state->state == IOLINK_MASTER_STATE_OPERATE)
         iolink_master_arm_send_gate(port, now_100us,
-            iolink_master_tbit_to_100us(iolink_master_startup_baudrate(port), 100U), true);
+            iolink_master_tbit_to_100us(iolink_master_startup_baudrate(port),
+                                      IOLINK_MASTER_T_INITCYC_TBIT) + 1U, true);
     if (pace_cycles && state->isdu.op != IOLINK_MASTER_ISDU_OP_NONE && !state->isdu.done &&
         (state->isdu.phase == IOLINK_MASTER_ISDU_PHASE_WAIT ||
          state->isdu.phase == IOLINK_MASTER_ISDU_PHASE_RESPONSE)) {
@@ -623,6 +624,15 @@ static int iolink_master_tick_common(iolink_master_port_t* port, iolink_master_t
         if (window < state->config.response_timeout_100us) window = state->config.response_timeout_100us;
         state->response_deadline_100us = now_100us + window;
         state->awaiting_response = true;
+        if (state->state == IOLINK_MASTER_STATE_STARTUP ||
+            state->state == IOLINK_MASTER_STATE_PREOPERATE) {
+            /* A.3.9 measures T_initcyc from request start to request start,
+               including retries. PREOPERATE here is still wire STARTUP.
+               One extra tick covers the caller's truncated 100us timestamp. */
+            iolink_master_arm_send_gate(port, now_100us,
+                iolink_master_tbit_to_100us(iolink_master_startup_baudrate(port),
+                                          IOLINK_MASTER_T_INITCYC_TBIT) + 1U, true);
+        }
     }
 
     /* iolink_master_process() increments cycle_count through the port pointer on a
@@ -858,6 +868,8 @@ static int iolink_master_restart_establish(iolink_master_port_t* port, uint32_t 
     state->configured = false;
     state->cycle_written = false;
     state->cycle_write_pending = false;
+    state->master_identified = false;
+    state->master_ident_pending = false;
     state->direct_address = 2U;
     memset(&state->isdu, 0, sizeof(state->isdu));
     state->isdu_tx_saved = false;
@@ -1076,6 +1088,25 @@ void iolink_master_process_at(iolink_master_port_t* port, uint32_t now_100us, bo
            using Type-0 PAGE requests, not an ISDU service (not yet available). */
         iolink_master_port_state_t* s = iolink_master_port_state(port);
         if (s->config.auto_configure && !s->cycle_written) {
+            /* Table 86 T21: read communication parameters 0x02..0x06, then
+               identify this V1.1 master before checking device identity.
+               A CKS-only ACK must arrive before any subsequent PAGE read. */
+            if (s->direct_address >= IOLINK_MASTER_DPP1_OFF_VENDOR_ID_HI &&
+                !s->master_identified) {
+                if (s->direct_page[IOLINK_MASTER_DPP1_OFF_REVISION_ID] !=
+                    IOLINK_MASTER_REVISION_1_1) {
+                    s->diagnostics.last_service_result = IOLINK_MASTER_PARAM_ERR_REVISION;
+                    s->state = IOLINK_MASTER_STATE_ERROR;
+                    return;
+                }
+                frame_len = iolink_frame_encode_type0_write(0x20U, IOLINK_MASTER_CMD_MASTER_IDENT,
+                                                            s->tx_buf, sizeof(s->tx_buf));
+                if (frame_len > 0 &&
+                    iolink_master_send_full(port, s->tx_buf, (size_t)frame_len)) {
+                    s->master_ident_pending = true;
+                }
+                return;
+            }
             if (s->direct_address < 16U) {
                 frame_len = iolink_frame_encode_type0((uint8_t)(0xA0U | s->direct_address),
                                                      s->tx_buf, sizeof(s->tx_buf));
@@ -1266,8 +1297,15 @@ int iolink_master_poll_rx(iolink_master_port_t* port)
     }
 
     if (recv_ret < 0) {
-        iolink_master_port_state(port)->state = IOLINK_MASTER_STATE_ERROR;
-        iolink_master_port_state(port)->rx.len = 0U;
+        iolink_master_port_state_t* state = iolink_master_port_state(port);
+        state->rx.len = 0U;
+        state->pd_valid = false;
+        if (recv_ret != IOLINK_PHY_RX_ERROR || iolink_master_flush_rx(port) != 0) {
+            state->state = IOLINK_MASTER_STATE_ERROR;
+        }
+        /* Keep a corrupt request outstanding until its deadline. The normal
+           timeout path restores the ISDU cursor and retries the same message;
+           during rate scan it advances to the next baudrate. */
         return IOLINK_MASTER_ERR_FRAME;
     }
 
@@ -1342,7 +1380,7 @@ int iolink_master_on_rx(iolink_master_port_t* port, const uint8_t* data, uint8_t
         !iolink_master_port_state(port)->cycle_written) {
         iolink_master_port_state_t* s = iolink_master_port_state(port);
         uint8_t msg[2] = {data[0], 0U};
-        uint8_t expected = s->cycle_write_pending ? 1U : 2U;
+        uint8_t expected = (s->master_ident_pending || s->cycle_write_pending) ? 1U : 2U;
         if (len != expected) return IOLINK_MASTER_ERR_FRAME;
         msg[expected - 1U] = data[expected - 1U] & 0xC0U;
         if (iolink_checksum6(msg, expected) != (data[expected - 1U] & 0x3FU)) {
@@ -1351,7 +1389,11 @@ int iolink_master_on_rx(iolink_master_port_t* port, const uint8_t* data, uint8_t
         }
         s->awaiting_response = false;
         s->diagnostics.rx_retry_count = 0U;
-        if (s->cycle_write_pending) { s->cycle_write_pending = false; s->cycle_written = true; }
+        if (s->master_ident_pending) {
+            s->master_ident_pending = false;
+            s->master_identified = true;
+        }
+        else if (s->cycle_write_pending) { s->cycle_write_pending = false; s->cycle_written = true; }
         else s->direct_page[s->direct_address++] = data[0];
         return 0;
     }

@@ -112,11 +112,16 @@ int TIOL112::receive(uint8_t *byte) {
     uart_event_t e;
     while (xQueueReceive(events_, &e, 0) == pdTRUE)
         consumeEvent(e);
-    if (rx_error_ || fault()) {
+    if (fault()) {
         flushRx();
-        return -1;
+        return IOLINK_PHY_RX_FAULT;
     }
-    return uart_read_bytes(uart(), byte, 1, 0);
+    if (rx_error_) {
+        flushRx();
+        return IOLINK_PHY_RX_ERROR;
+    }
+    const int received = uart_read_bytes(uart(), byte, 1, 0);
+    return received < 0 ? IOLINK_PHY_RX_FAULT : received;
 }
 const iolink_phy_api_t *TIOL112::api() {
     api_.user = this;

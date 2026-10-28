@@ -523,7 +523,8 @@ static int fake_iolink_device_send(void* user, const uint8_t* data, size_t len)
 
     /* Spec DeviceOperate: Type-0 WRITE of MasterCommand 0x99 to Direct Parameter
        address 0x00 on the page channel (MC 0x20). Establishes communication. */
-    if(len == 3U && data[0] == 0x21U) {
+    /* CKS-only acknowledgements for MasterCycleTime and MasterIdent. */
+    if(len == 3U && (data[0] == 0x21U || (data[0] == 0x20U && data[2] == 0x95U))) {
         g_device.rx_pos = 0; g_device.rx_len = 1;
         uint8_t flags = 0;
         g_device.rx_queue[0] = iolink_checksum6(&flags, 1);

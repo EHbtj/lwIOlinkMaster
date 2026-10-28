@@ -55,6 +55,8 @@
 #define IOLINK_MASTER_UART_FRAME_TBIT 11U
 /** @brief Maximum device response delay in bit times (t_A, A.3.5). */
 #define IOLINK_MASTER_T_A_MAX_TBIT 10U
+/** @brief STARTUP TYPE_0 minimum request-start spacing (Table A.7, A.3.9). */
+#define IOLINK_MASTER_T_INITCYC_TBIT 100U
 /** @} */
 /** @brief Wake-up request pattern (alternating bits) emitted when no wake_up hook is set. */
 #define IOLINK_MASTER_WAKEUP_BYTE 0x55U
@@ -63,6 +65,8 @@
  *  @{
  */
 #define IOLINK_MASTER_DPP1_LEN 16U /**< Direct Parameter Page 1 length, in bytes. */
+/** @brief Identify a V1.1 master (MasterCommand, Table B.2). */
+#define IOLINK_MASTER_CMD_MASTER_IDENT 0x95U
 #define IOLINK_MASTER_DPP1_OFF_MASTER_COMMAND 0x00U /**< Offset of the MasterCommand octet. */
 #define IOLINK_MASTER_DPP1_OFF_MIN_CYCLE_TIME 0x02U /**< Offset of the MinCycleTime octet. */
 #define IOLINK_MASTER_DPP1_OFF_MSEQ_CAPABILITY \
@@ -314,6 +318,8 @@ typedef struct
     bool configured;
     bool cycle_written;
     bool cycle_write_pending;
+    bool master_identified; /* MasterIdent was acknowledged on this link. */
+    bool master_ident_pending;
     uint32_t exchange_count;
     uint8_t tx_octets;
     uint16_t saved_request_pos;

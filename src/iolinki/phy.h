@@ -44,6 +44,13 @@ typedef enum
     IOLINK_BAUDRATE_COM3 = 2U  /**< 230.4 kbit/s */
 } iolink_baudrate_t;
 
+/** @brief Negative recv_byte results. Other negative values remain fatal errors. */
+typedef enum
+{
+    IOLINK_PHY_RX_FAULT = -1, /**< Hardware/driver failure; explicit restart required. */
+    IOLINK_PHY_RX_ERROR = -2  /**< Corrupt/overflowed UART input; discard and retry. */
+} iolink_phy_rx_result_t;
+
 /**
  * @brief Physical Layer (PHY) API Structure
  *
@@ -83,7 +90,9 @@ typedef struct
     /**
      * @brief Non-blocking receive for a single byte
      * @param byte Pointer to store received byte
-     * @return 1 if byte available and read, 0 if nothing received, negative on error
+     * @return 1 if a byte was read, 0 if no byte is available,
+     *         IOLINK_PHY_RX_ERROR for a recoverable receive error, or another
+     *         negative value for a hardware/driver failure.
      */
     int (*recv_byte)(void* user, uint8_t* byte);
 
