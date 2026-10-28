@@ -251,6 +251,8 @@ typedef struct
      *  reply to a diagnosis read may be routed into the event memory. A cyclic
      *  reply still in flight when the readout starts must not complete it. */
     bool od_expected;
+    bool confirm_pending; /**< StatusCode WRITE sent; wait for a valid reply before completing. */
+    bool reported; /**< Deliver events once, before releasing the device memory. */
     int result;                        /**< Latched final result. */
 } iolink_master_event_state_t;
 

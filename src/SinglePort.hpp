@@ -9,6 +9,12 @@ namespace lwIOLink {
 class SinglePort {
   public:
     static constexpr size_t MaxIsdu = 232;
+    static constexpr uint8_t EventCapacity = 16;
+    struct Event {
+        uint32_t sequence = 0;
+        uint32_t time100us = 0;
+        iolink_master_event_t value{};
+    };
     enum Error {
         Busy = -100,
         NotReady = -101,
@@ -38,6 +44,13 @@ class SinglePort {
     uint32_t sampleTime() const { return sample_time_; }
     uint16_t cycleTime() const;
     int lastError() const { return last_error_; }
+    // Events are collected/acknowledged automatically, independently of USB.
+    bool popEvent(Event &event);
+    uint8_t eventCount() const { return event_count_; }
+    uint32_t droppedEvents() const { return dropped_events_; }
+    int lastEventError() const { return event_error_; }
+    // Conservative overall ISDU budget for the current link (minimum 30 s).
+    uint32_t isduTimeout100us() const;
 
   private:
     const iolink_phy_api_t *phy_;
@@ -48,8 +61,16 @@ class SinglePort {
     uint8_t subindex_ = 0, write_size_ = 0;
     uint8_t write_data_[MaxIsdu]{};
     uint32_t now_ = 0, request_time_ = 0, sample_time_ = 0;
+    uint32_t request_timeout_ = 300000;
     int last_error_ = 0;
     Result result_;
+    Event events_[EventCapacity]{};
+    uint8_t event_head_ = 0, event_count_ = 0;
+    uint32_t event_sequence_ = 0, dropped_events_ = 0;
+    bool event_active_ = false;
+    int event_error_ = 0;
     void finish(int code);
+    void pollEvents();
+    void pushEvent(const iolink_master_event_t &value);
 };
 } // namespace lwIOLink

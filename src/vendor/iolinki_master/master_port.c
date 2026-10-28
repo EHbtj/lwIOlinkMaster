@@ -38,6 +38,14 @@ static bool iolink_master_type0_reply_ok(const uint8_t* frame)
     return iolink_checksum6(msg, 2U) == (uint8_t) (frame[1] & 0x3FU);
 }
 
+static void iolink_master_update_event_flag(iolink_master_port_t* port, bool pending)
+{
+    iolink_master_port_state_t* state = iolink_master_port_state(port);
+    if (pending && !state->diagnostics.event_pending && state->config.event_pending_handler != NULL)
+        state->config.event_pending_handler(state->config.event_user);
+    state->diagnostics.event_pending = pending;
+}
+
 /** @brief Return true if startup must read/validate device info (device-info check or inspection
  * enabled). */
 static bool iolink_master_startup_validation_required(const iolink_master_config_t* config)
@@ -420,18 +428,13 @@ static bool iolink_master_send_event(iolink_master_port_t* port)
     }
 
     if (frame_len > 0) {
-        if (iolink_master_send_full(port, state->tx_buf, (size_t) frame_len) && read) {
+        if (iolink_master_send_full(port, state->tx_buf, (size_t) frame_len)) {
             /* Arm the OD routing only once the diagnosis read is on the wire:
              * the reply to a cyclic frame sent earlier may still land while the
              * readout is active. */
-            state->event.od_expected = true;
+            state->event.od_expected = read;
+            state->event.confirm_pending = !read;
         }
-    }
-
-    if (!read) {
-        /* Table 59 T8: the StatusCode write completes the readout; the device
-           release is not gated on the reply octet. */
-        iolink_master_event_on_written(port);
     }
 
     return frame_len > 0;
@@ -875,6 +878,8 @@ static int iolink_master_restart_establish(iolink_master_port_t* port, uint32_t 
     state->master_ident_pending = false;
     state->direct_address = 2U;
     memset(&state->isdu, 0, sizeof(state->isdu));
+    memset(&state->event, 0, sizeof(state->event));
+    state->diagnostics.event_pending = false;
     state->isdu_tx_saved = false;
     state->isdu_completion_tx = 0U;
     state->isdu_wait_timed = false;
@@ -1341,8 +1346,16 @@ static void iolink_master_route_od(iolink_master_port_t* port, const uint8_t* od
         if (read && state->event.od_expected) {
             state->event.od_expected = false;
             iolink_master_event_on_od(port, od, od_len);
+            return;
         }
-        return;
+        if (!read && state->event.confirm_pending) {
+            state->event.confirm_pending = false;
+            iolink_master_event_on_written(port);
+            state->diagnostics.event_pending = false;
+            return;
+        }
+        /* A service can start while an ISDU/cyclic reply is in flight. That
+           reply still belongs to ISDU until a diagnosis request is sent. */
     }
 
     iolink_master_isdu_on_od(port, od, od_len);
@@ -1420,14 +1433,7 @@ int iolink_master_on_rx(iolink_master_port_t* port, const uint8_t* data, uint8_t
         }
         if (iolink_checksum6(&flags, 1U) != (uint8_t) (data[0] & 0x3FU)) {
             iolink_master_port_state(port)->diagnostics.checksum_errors++;
-            if (iolink_master_port_state(port)->diagnostics.rx_retry_count <
-                IOLINK_MASTER_RX_RETRY_LIMIT) {
-                iolink_master_port_state(port)->diagnostics.rx_retry_count++;
-            }
-            else {
-                /* MaxRetry exhausted (Table 46 ErrorHandling): COMLOST. */
-                (void) iolink_master_restart_establish(port, 0U, false);
-            }
+            /* The outstanding request's deadline owns the retry counter. */
             return IOLINK_MASTER_ERR_CHECKSUM;
         }
         iolink_master_port_state(port)->diagnostics.rx_retry_count = 0U;
@@ -1444,14 +1450,6 @@ int iolink_master_on_rx(iolink_master_port_t* port, const uint8_t* data, uint8_t
 
         if (!iolink_master_type0_reply_ok(data)) {
             iolink_master_port_state(port)->diagnostics.checksum_errors++;
-            if (iolink_master_port_state(port)->diagnostics.rx_retry_count <
-                IOLINK_MASTER_RX_RETRY_LIMIT) {
-                iolink_master_port_state(port)->diagnostics.rx_retry_count++;
-            }
-            else {
-                /* MaxRetry exhausted (Table 46 ErrorHandling): COMLOST. */
-                (void) iolink_master_restart_establish(port, 0U, false);
-            }
             return IOLINK_MASTER_ERR_CHECKSUM;
         }
 
@@ -1474,14 +1472,6 @@ int iolink_master_on_rx(iolink_master_port_t* port, const uint8_t* data, uint8_t
 
         if (!iolink_master_type0_reply_ok(data)) {
             iolink_master_port_state(port)->diagnostics.checksum_errors++;
-            if (iolink_master_port_state(port)->diagnostics.rx_retry_count <
-                IOLINK_MASTER_RX_RETRY_LIMIT) {
-                iolink_master_port_state(port)->diagnostics.rx_retry_count++;
-            }
-            else {
-                /* MaxRetry exhausted (Table 46 ErrorHandling): COMLOST. */
-                (void) iolink_master_restart_establish(port, 0U, false);
-            }
             return IOLINK_MASTER_ERR_CHECKSUM;
         }
 
@@ -1489,6 +1479,7 @@ int iolink_master_on_rx(iolink_master_port_t* port, const uint8_t* data, uint8_t
         iolink_master_port_state(port)->awaiting_response = false;
         iolink_master_port_state(port)->isdu_completion_tx = 0U;
         iolink_master_port_state(port)->isdu_tx_saved = false;
+        iolink_master_update_event_flag(port, (data[1] & 0x80U) != 0U);
         iolink_master_route_od(port, data, 1U);
         return IOLINK_MASTER_STATUS_OK;
     }
@@ -1506,14 +1497,6 @@ int iolink_master_on_rx(iolink_master_port_t* port, const uint8_t* data, uint8_t
 
     if (!resp.checksum_ok) {
         iolink_master_port_state(port)->diagnostics.checksum_errors++;
-        if (iolink_master_port_state(port)->diagnostics.rx_retry_count <
-            IOLINK_MASTER_RX_RETRY_LIMIT) {
-            iolink_master_port_state(port)->diagnostics.rx_retry_count++;
-        }
-        else {
-            /* MaxRetry exhausted (Table 46 ErrorHandling_17): COMLOST. */
-            (void) iolink_master_restart_establish(port, 0U, false);
-        }
         return IOLINK_MASTER_ERR_CHECKSUM;
     }
 
@@ -1529,12 +1512,7 @@ int iolink_master_on_rx(iolink_master_port_t* port, const uint8_t* data, uint8_t
      * notification: the application reacts by reading event details (which then
      * dispatches each decoded event through config.event_handler).
      */
-    if (resp.event_pending && !iolink_master_port_state(port)->diagnostics.event_pending &&
-        (iolink_master_port_state(port)->config.event_pending_handler != NULL)) {
-        iolink_master_port_state(port)->config.event_pending_handler(
-            iolink_master_port_state(port)->config.event_user);
-    }
-    iolink_master_port_state(port)->diagnostics.event_pending = resp.event_pending;
+    iolink_master_update_event_flag(port, resp.event_pending);
 
     iolink_master_port_state(port)->pd_valid = resp.pd_valid;
     if (resp.pd_valid) {
@@ -1615,8 +1593,8 @@ int iolink_master_get_diagnostics(const iolink_master_port_t* port,
                                   iolink_master_diagnostics_t* diagnostics)
 {
     const iolink_master_port_state_t* state;
-    uint32_t error_count;
-    uint32_t total_count;
+    uint64_t error_count;
+    uint64_t total_count;
 
     if ((port == NULL) || (diagnostics == NULL)) {
         return IOLINK_MASTER_ERR_INVALID_ARG;
@@ -1631,10 +1609,10 @@ int iolink_master_get_diagnostics(const iolink_master_port_t* port,
                                      ? state->phy->is_short_circuit(state->phy->user)
                                      : false;
     error_count =
-        diagnostics->checksum_errors + diagnostics->send_errors + diagnostics->response_timeouts;
+        (uint64_t) diagnostics->checksum_errors + diagnostics->send_errors + diagnostics->response_timeouts;
     total_count = state->cycle_count + error_count;
     diagnostics->link_quality_percent =
-        (total_count == 0U) ? 100U : (uint8_t) ((state->cycle_count * 100U) / total_count);
+        (total_count == 0U) ? 100U : (uint8_t) (((uint64_t) state->cycle_count * 100U) / total_count);
     return IOLINK_MASTER_STATUS_OK;
 }
 

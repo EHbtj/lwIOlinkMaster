@@ -442,8 +442,7 @@ static void fake_iolink_device_queue_diagnosis_read(uint8_t addr, uint8_t od_len
 
     for(i = 0U; i < od_len; i++)
     {
-        g_device.rx_queue[pos++] =
-            fake_iolink_device_event_memory_octet((uint8_t)(addr + i));
+        g_device.rx_queue[pos++] = (i == 0U) ? fake_iolink_device_event_memory_octet(addr) : 0U;
     }
     for(i = 0U; i < g_device.pd_in_len; i++)
     {
@@ -487,6 +486,7 @@ static int fake_iolink_device_send(void* user, const uint8_t* data, size_t len)
             /* StatusCode confirmation: the device release is not gated on a
                reply octet (Table 59 T8); clear the Event flag. */
             g_device.event_pending = false;
+            fake_iolink_device_queue_operate_response(false);
         }
         return (int)len;
     }

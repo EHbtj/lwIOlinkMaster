@@ -212,7 +212,8 @@ typedef struct
  * `event_pending_handler` fires on the rising edge of the OD Event flag during a
  * cyclic response, prompting the application to read event details;
  * `event_handler` fires once per decoded event from
- * `iolink_master_read_event_details`. Both may be NULL to keep poll-only
+ * `iolink_master_read_event_details` or during read-and-confirm collection.
+ * Both may be NULL to keep poll-only
  * behavior. `event_user` is passed through unchanged.
  */
 typedef void (*iolink_master_event_pending_cb_t)(void* user);
@@ -893,8 +894,8 @@ int iolink_master_read_event_code(iolink_master_port_t* port, uint16_t* event_co
  *
  * @param port             Port to operate on.
  * @param[out] event_code  Filled with the acknowledged event code.
- * @return ::IOLINK_MASTER_STATUS_OK when the device's event-code read completes;
- *         this read is the explicit ack policy.
+ * @return ::IOLINK_MASTER_STATUS_OK after the readout and a valid response to
+ *         the StatusCode confirmation WRITE, or PENDING/error while in progress.
  */
 int iolink_master_ack_event(iolink_master_port_t* port, uint16_t* event_code);
 /**
@@ -910,6 +911,16 @@ int iolink_master_ack_event(iolink_master_port_t* port, uint16_t* event_code);
  */
 int iolink_master_read_event_details(iolink_master_port_t* port, iolink_master_event_t* events,
                                      uint8_t max_events, uint8_t* out_count);
+/**
+ * @brief Collect events and confirm StatusCode; poll until OK/PENDING/error.
+ * Event callbacks run once after readout, before the confirmation WRITE, so
+ * applications can retain alarms even if its reply is lost. Completion requires
+ * a valid reply to the confirmation WRITE. Supports both
+ * detailed events (up to six) and mapped legacy StatusCode events (up to five).
+ * A too-small output buffer reports the required count without consuming it.
+ */
+int iolink_master_read_and_ack_events(iolink_master_port_t* port, iolink_master_event_t* events,
+                                      uint8_t max_events, uint8_t* out_count);
 
 /** @} */ /* end of Event services */
 

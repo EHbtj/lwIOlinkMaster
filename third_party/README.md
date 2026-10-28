@@ -53,6 +53,13 @@ IO-Link silicon here.
   232-byte/extended ISDU objects, malformed replies, busy replies and invalid PD.
   START discards leftover OD padding; IDLE/ABORT releases the service state.
   Only this fixture is used by our tests; the upstream CMocka suite is not bundled.
+- Event collection now supports read-and-confirm batches, reports alarms before
+  releasing device memory, and retries confirmation until a valid reply arrives.
+  Diagnosis reads consume OD0 only, including multi-octet OD profiles. Legacy
+  StatusCode flags are mapped to standard events. Link recovery clears in-flight
+  event state; SinglePort retains collected alarms in a bounded queue.
+- Checksums count a failed request only in its response-deadline path, so both
+  allowed retries remain available. Link-quality arithmetic uses 64-bit totals.
 
 `local-changes.patch` records the exact changes to relocated upstream files.
 `SHA256SUMS` records the normalized vendored sources used in this checkout.

@@ -13,6 +13,7 @@ Python / PC ── USB CDC ── ESP32-C3/S3 ── UART1 + EN ── TIOL1123 
 - 基準ボード: Seeed XIAO ESP32C3。S3の接続例はESP32-S3-DevKitC-1。
 - Arduino-ESP32 **3.3.11**、ArduinoJson **7.4.3**。
 - COM3 → COM2 → COM1の自動検出、Direct Parameter Page 1の読出し、周期設定とOPERATE遷移。
+- センサー診断イベントの自動読出し・確認と、USB `events`による取得。
 - 対象: IO-Link RevisionID 0x11、Class A、周期出力なし、OPERATE M-sequence code 0 / 4 / 5。
   入力は最大32バイト。ただしcode 0は最大2バイト、code 4は3バイト以上。
   ISDUは対応機器で最大232バイトの読み書き。
@@ -63,6 +64,9 @@ ArduinoファームウェアとPCソフトは、[USB protocol v1](docs/usb-proto
 
 新しい通信APIは`SinglePort`、USBエンドポイントは`UsbProtocol`です。
 `SinglePort`とPHYは同じ通信タスクから操作し、USB側とはキューで接続します。
+診断イベントは`SinglePort::popEvent()`でも取得できます。16件を超えると最古を破棄し、
+`droppedEvents()`へ記録します。ISDUの全体期限は`isduTimeout100us()`で取得できます。
+長周期で使用するPCソフトは、[USBプロトコル](docs/usb-protocol.md)に従って要求期限も設定してください。
 既存の`Master` / `Port`はPHY初期化用の旧APIとして残しています。
 TIOL112ドライバーはUART1を直接所有します。`Serial1.begin()`と併用しないでください。
 

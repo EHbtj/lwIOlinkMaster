@@ -219,6 +219,25 @@ void UsbProtocol::dispatch() {
         d["response_timeouts"] = diag.response_timeouts;
         d["cycle_slips"] = diag.cycle_slips;
         d["device_error"] = diag.last_isdu_error;
+        d["event_pending"] = diag.event_pending;
+        d["events_available"] = port_.eventCount();
+        d["events_dropped"] = port_.droppedEvents();
+        d["last_event_error"] = port_.lastEventError();
+        d["link_quality_percent"] = diag.link_quality_percent;
+        d["isdu_timeout_us"] = uint64_t(port_.isduTimeout100us()) * 100U;
+    } else if (!std::strcmp(op, "events")) {
+        auto list = d["events"].to<JsonArray>();
+        SinglePort::Event event;
+        for (unsigned i = 0; i < 6 && port_.popEvent(event); ++i) {
+            auto item = list.add<JsonObject>();
+            item["sequence"] = event.sequence;
+            item["time_100us"] = event.time100us;
+            item["qualifier"] = event.value.qualifier;
+            item["type"] = unsigned(event.value.type);
+            item["code"] = event.value.code;
+        }
+        d["remaining"] = port_.eventCount();
+        d["dropped"] = port_.droppedEvents();
     } else if (!std::strcmp(op, "info")) {
         iolink_master_device_info_t info{};
         if (port_.deviceInfo(info) != 0) {

@@ -829,6 +829,47 @@ static void iolink_master_event_start(iolink_master_port_t* port,
     ev->result = IOLINK_MASTER_STATUS_PENDING;
 }
 
+static iolink_master_event_type_t iolink_master_event_type_from_qualifier(uint8_t qualifier);
+
+static uint8_t iolink_master_decode_events(const uint8_t* memory, iolink_master_event_t* decoded)
+{
+    uint8_t count = 0U;
+    if ((memory[0] & IOLINK_MASTER_EVENT_STATUS_DETAILS) == 0U) {
+        static const uint16_t legacy_codes[5] = {0xFF80U, 0xFF80U, 0x6320U, 0xFF80U, 0xFF10U};
+        for (int bit = 4; bit >= 0; --bit) {
+            if ((memory[0] & (1U << bit)) != 0U) {
+                decoded[count].qualifier = 0x54U;
+                decoded[count].type = IOLINK_MASTER_EVENT_TYPE_NOTIFICATION;
+                decoded[count++].code = legacy_codes[bit];
+            }
+        }
+    } else {
+        for (uint8_t slot = 0U; slot < IOLINK_MASTER_EVENT_SLOT_MAX; ++slot) {
+            if ((memory[0] & (1U << slot)) == 0U) continue;
+            const uint8_t base = (uint8_t)(1U + 3U * slot);
+            decoded[count].qualifier = memory[base];
+            decoded[count].type = iolink_master_event_type_from_qualifier(memory[base]);
+            decoded[count++].code = (uint16_t)(((uint16_t)memory[base + 1U] << 8U) | memory[base + 2U]);
+        }
+    }
+    return count;
+}
+
+static void iolink_master_report_events(iolink_master_port_t* port)
+{
+    iolink_master_port_state_t* state = iolink_master_port_state(port);
+    if (state->event.reported) return;
+    iolink_master_event_t decoded[6];
+    const uint8_t count = iolink_master_decode_events(state->event.memory, decoded);
+    state->event.reported = true;
+    state->diagnostics.last_event_count = count;
+    state->diagnostics.last_event_code = count ? decoded[count - 1U].code : 0U;
+    if (state->config.event_handler != NULL) {
+        for (uint8_t i = 0U; i < count; ++i)
+            state->config.event_handler(state->config.event_user, &decoded[i]);
+    }
+}
+
 bool iolink_master_event_channel_access(const iolink_master_port_t* port, bool* read, uint8_t* addr,
                                         uint8_t* od_len)
 {
@@ -850,10 +891,7 @@ bool iolink_master_event_channel_access(const iolink_master_port_t* port, bool* 
         *addr = ev->addr;
     }
     if (od_len != NULL) {
-        /* One OD octet per read for TYPE_0 and the one-octet TYPE_2_x variants
-           (Table A.10); TYPE_2_V and the TYPE_1_x types carry their configured
-           OD width. The address advances by the number of octets the device
-           returns (Table 58 slot layout). */
+        /* Wire width stays configured; diagnosis evaluates only OD0 (A.2.3). */
         *od_len = iolink_master_port_const_state(port)->od_len;
     }
     return true;
@@ -873,6 +911,10 @@ void iolink_master_event_on_od(iolink_master_port_t* port, const uint8_t* od, ui
         return;
     }
 
+    /* A.2.3/A.2.4: extra diagnosis OD octets may be padding or subsequent
+       memory, but the master shall evaluate OD0 only. */
+    if (od_len > 1U) od_len = 1U;
+
     for (i = 0U; i < od_len; i++) {
         if ((ev->addr < IOLINK_MASTER_EVENT_MEMORY_LEN) && (ev->len < IOLINK_MASTER_EVENT_MEMORY_LEN)) {
             ev->memory[ev->addr] = od[i];
@@ -882,7 +924,8 @@ void iolink_master_event_on_od(iolink_master_port_t* port, const uint8_t* od, ui
 
         if (!ev->status_seen && (ev->len >= 1U)) {
             uint8_t status = ev->memory[0];
-            uint8_t active = (uint8_t) (status & 0x3FU);
+            uint8_t active = (status & IOLINK_MASTER_EVENT_STATUS_DETAILS)
+                                 ? (uint8_t) (status & 0x3FU) : 0U;
             uint8_t slot;
 
             ev->status_seen = true;
@@ -902,6 +945,9 @@ void iolink_master_event_on_od(iolink_master_port_t* port, const uint8_t* od, ui
     if (ev->status_seen && (ev->len >= ev->needed) &&
         (ev->len >= 1U)) {
         if (ev->request == IOLINK_MASTER_EVENT_REQ_ACK) {
+            /* Retain/report alarms before releasing frozen device memory,
+               even if the confirmation reply is later lost. */
+            iolink_master_report_events(port);
             /* Table 59 T8: confirm the readout by writing any value to the
                StatusCode at address 0. */
             ev->phase = IOLINK_MASTER_EVENT_PHASE_WRITE;
@@ -938,19 +984,8 @@ static bool iolink_master_event_complete(const iolink_master_port_t* port)
  */
 static uint16_t iolink_master_event_first_code(const uint8_t* memory)
 {
-    uint8_t active = (uint8_t) (memory[0] & 0x3FU);
-    uint8_t slot;
-
-    for (slot = 0U; slot < IOLINK_MASTER_EVENT_SLOT_MAX; slot++) {
-        if ((active & (uint8_t) (1U << slot)) != 0U) {
-            uint8_t base = (uint8_t) (1U + (IOLINK_MASTER_EVENT_ENTRY_LEN * slot));
-
-            return (uint16_t) (((uint16_t) memory[(uint8_t) (base + 1U)] << 8U) |
-                               memory[(uint8_t) (base + 2U)]);
-        }
-    }
-
-    return 0U;
+    iolink_master_event_t decoded[6];
+    return iolink_master_decode_events(memory, decoded) ? decoded[0].code : 0U;
 }
 
 int iolink_master_read_event_code(iolink_master_port_t* port, uint16_t* event_code)
@@ -1031,15 +1066,14 @@ static iolink_master_event_type_t iolink_master_event_type_from_qualifier(uint8_
     }
 }
 
-int iolink_master_read_event_details(iolink_master_port_t* port, iolink_master_event_t* events,
-                                     uint8_t max_events, uint8_t* out_count)
+static int iolink_master_collect_events(iolink_master_port_t* port, iolink_master_event_t* events,
+                                       uint8_t max_events, uint8_t* out_count,
+                                       iolink_master_event_req_t request)
 {
     iolink_master_event_state_t* ev;
-    uint8_t active;
-    uint8_t count = 0U;
-    uint8_t slot;
+    uint8_t count;
 
-    if ((port == NULL) || (events == NULL) || (out_count == NULL)) {
+    if ((port == NULL) || (events == NULL) || (out_count == NULL) || max_events == 0U) {
         return IOLINK_MASTER_ERR_INVALID_ARG;
     }
 
@@ -1049,55 +1083,46 @@ int iolink_master_read_event_details(iolink_master_port_t* port, iolink_master_e
     }
 
     ev = &iolink_master_port_state(port)->event;
+    if (ev->request != IOLINK_MASTER_EVENT_REQ_NONE && ev->request != request) {
+        return IOLINK_MASTER_ISDU_ERR_BUSY;
+    }
     if (ev->phase != IOLINK_MASTER_EVENT_PHASE_NONE) {
         return IOLINK_MASTER_STATUS_PENDING;
     }
 
     if (!iolink_master_event_complete(port)) {
-        iolink_master_event_start(port, IOLINK_MASTER_EVENT_REQ_DETAILS);
+        iolink_master_event_start(port, request);
         return IOLINK_MASTER_STATUS_PENDING;
     }
 
-    /* Table 58: Active slots are reported in the StatusCode bits 0-5. */
-    active = (uint8_t) (ev->memory[0] & 0x3FU);
-    count = 0U;
-    for (slot = 0U; slot < IOLINK_MASTER_EVENT_SLOT_MAX; slot++) {
-        uint8_t base;
-
-        if ((active & (uint8_t) (1U << slot)) == 0U) {
-            continue;
-        }
-        base = (uint8_t) (1U + (IOLINK_MASTER_EVENT_ENTRY_LEN * slot));
-        events[count].qualifier = ev->memory[base];
-        events[count].type = iolink_master_event_type_from_qualifier(events[count].qualifier);
-        events[count].code = (uint16_t) (((uint16_t) ev->memory[(uint8_t) (base + 1U)] << 8U) |
-                                         ev->memory[(uint8_t) (base + 2U)]);
-        count++;
-        if (count >= max_events) {
-            if (count < IOLINK_MASTER_MAX_EVENTS) {
-                /* Report the events decoded so far but signal the overflow. */
-                break;
-            }
-            break;
-        }
-    }
+    /* Decode into a bounded local batch, retaining the result if the caller's
+       buffer is too small. Table A.16 maps legacy flags MSB first. */
+    iolink_master_event_t decoded[6];
+    count = iolink_master_decode_events(ev->memory, decoded);
 
     *out_count = count;
-    iolink_master_port_state(port)->diagnostics.last_event_count = count;
-    iolink_master_port_state(port)->diagnostics.last_event_code =
-        (count > 0U) ? events[count - 1U].code : 0U;
-
-    if (iolink_master_port_state(port)->config.event_handler != NULL) {
-        uint8_t i;
-
-        for (i = 0U; i < count; i++) {
-            iolink_master_port_state(port)->config.event_handler(
-                iolink_master_port_state(port)->config.event_user, &events[i]);
-        }
+    if (count > max_events) {
+        return IOLINK_MASTER_ERR_BUFFER_TOO_SMALL;
     }
+    (void) memcpy(events, decoded, (size_t)count * sizeof(decoded[0]));
+    iolink_master_report_events(port);
 
     ev->request = IOLINK_MASTER_EVENT_REQ_NONE;
     return IOLINK_MASTER_STATUS_OK;
+}
+
+int iolink_master_read_event_details(iolink_master_port_t* port, iolink_master_event_t* events,
+                                     uint8_t max_events, uint8_t* out_count)
+{
+    return iolink_master_collect_events(port, events, max_events, out_count,
+                                        IOLINK_MASTER_EVENT_REQ_DETAILS);
+}
+
+int iolink_master_read_and_ack_events(iolink_master_port_t* port, iolink_master_event_t* events,
+                                      uint8_t max_events, uint8_t* out_count)
+{
+    return iolink_master_collect_events(port, events, max_events, out_count,
+                                        IOLINK_MASTER_EVENT_REQ_ACK);
 }
 
 /** @brief Write a single-byte SystemCommand value to the device via ISDU. */
